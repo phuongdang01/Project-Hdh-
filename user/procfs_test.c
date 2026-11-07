@@ -57,6 +57,49 @@ test_small_buffer(void)
   assert_test(total_read > 0, "Doc voi buffer nho (Read chunking)");
 }
 
+void
+test_processes(void)
+{
+  int fd = open("/proc/processes", O_RDONLY);
+  char buf[512];
+  int n;
+
+  if (fd < 0) {
+    assert_test(0, "Doc danh sach tien trinh tu struct proc");
+    return;
+  }
+  n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n > 0) {
+    buf[n] = '\0';
+    printf("%s", buf);
+    assert_test(1, "Doc danh sach tien trinh tu struct proc");
+  } else {
+    assert_test(0, "Doc danh sach tien trinh tu struct proc");
+  }
+}
+
+void
+test_open_modes(void)
+{
+  int fd;
+
+  fd = open("/proc/processes", O_WRONLY);
+  assert_test(fd < 0, "Tu choi mo ProcFS de ghi");
+  if (fd >= 0)
+    close(fd);
+
+  fd = open("/proc/processes", O_RDWR);
+  assert_test(fd < 0, "Tu choi mo ProcFS hai chieu");
+  if (fd >= 0)
+    close(fd);
+
+  fd = open("/proc/new", O_CREATE);
+  assert_test(fd < 0, "Tu choi tao file trong ProcFS");
+  if (fd >= 0)
+    close(fd);
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -67,6 +110,8 @@ main(int argc, char *argv[])
   test_read_file("/proc/uptime", "Doc file /proc/uptime");
   test_read_file("/proc/meminfo", "Doc file /proc/meminfo");
   test_small_buffer();
+  test_processes();
+  test_open_modes();
 
   printf("=======================================\n");
   exit(0);

@@ -7,6 +7,7 @@
 #include "fs.h"
 #include "file.h"
 #include "stat.h"
+#include "proc.h"
 
 // Biến ticks và khóa đồng bộ thời gian từ kernel/trap.c
 extern uint ticks;
@@ -15,7 +16,9 @@ extern struct spinlock tickslock;
 // Inode ảo tĩnh đại diện cho tệp /proc/uptime trong RAM
 static struct inode proc_uptime_inode;
 static struct inode proc_meminfo_inode;
+static struct inode proc_processes_inode;
 static int proc_inited = 0;
+extern struct proc proc[NPROC];
 
 // Hàm phụ trợ so sánh 2 chuỗi ký tự an toàn trong kernel
 static int
@@ -46,11 +49,65 @@ procfs_itoa(char *buf, uint n)
     n /= 10;
   }
 
-  while (i > 0) {
+  while (i > 0)
     buf[j++] = tmp[--i];
-  }
   buf[j] = '\0';
   return j;
+}
+
+static int
+procfs_itoa64(char *buf, uint64 n)
+{
+  char tmp[24];
+  int i = 0, j = 0;
+
+  if (n == 0) {
+    buf[j++] = '0';
+    buf[j] = '\0';
+    return j;
+  }
+
+  while (n > 0) {
+    tmp[i++] = (n % 10) + '0';
+    n /= 10;
+  }
+
+  while (i > 0)
+    buf[j++] = tmp[--i];
+  buf[j] = '\0';
+  return j;
+}
+
+static char *
+procfs_state_name(enum procstate state)
+{
+  switch (state) {
+  case USED: return "USED";
+  case SLEEPING: return "SLEEP";
+  case RUNNABLE: return "RUNNABLE";
+  case RUNNING: return "RUNNING";
+  case ZOMBIE: return "ZOMBIE";
+  default: return "UNUSED";
+  }
+}
+
+static void
+procfs_append(char *buf, int *len, int max, char *text)
+{
+  while (*text && *len < max - 1)
+    buf[(*len)++] = *text++;
+}
+
+int
+procfs_is_path(char *path)
+{
+  return procfs_streq(path, "/proc") == 0 ||
+         procfs_streq(path, "proc") == 0 ||
+         (procfs_streq(path, "/proc/") == 0) ||
+         (path[0] == '/' && path[1] == 'p' && path[2] == 'r' &&
+          path[3] == 'o' && path[4] == 'c' && path[5] == '/') ||
+         (path[0] == 'p' && path[1] == 'r' && path[2] == 'o' &&
+          path[3] == 'c' && path[4] == '/');
 }
 
 // 1. Hàm tra cứu và cấp phát Inode ảo cho ProcFS
@@ -73,6 +130,13 @@ procfs_lookup(char *path)
     proc_meminfo_inode.type = T_PROC;
     proc_meminfo_inode.valid = 1;
     proc_meminfo_inode.nlink = 1;
+    initsleeplock(&proc_processes_inode.lock, "proc_processes");
+    proc_processes_inode.dev = 0;
+    proc_processes_inode.inum = 9997;
+    proc_processes_inode.ref = 0;
+    proc_processes_inode.type = T_PROC;
+    proc_processes_inode.valid = 1;
+    proc_processes_inode.nlink = 1;
     proc_inited = 1;
   }
 
@@ -86,6 +150,11 @@ procfs_lookup(char *path)
       procfs_streq(path, "proc/meminfo") == 0) {
     proc_meminfo_inode.ref++;
     return &proc_meminfo_inode;
+  }
+  if (procfs_streq(path, "/proc/processes") == 0 ||
+      procfs_streq(path, "proc/processes") == 0) {
+    proc_processes_inode.ref++;
+    return &proc_processes_inode;
   }
   return 0; // Trả về null nếu không tìm thấy tệp
 }
@@ -150,6 +219,62 @@ procfs_read_meminfo(int user_dst, uint64 dst, uint off, uint n)
 
   return m;
 }
+
+int
+procfs_read_processes(int user_dst, uint64 dst, uint off, uint n)
+{
+  struct proc *p;
+  char line[96];
+  char number[24];
+  int len, pos = 0, copied = 0;
+  uint start, count;
+
+  procfs_append(line, &pos, sizeof(line), "PID STATE SIZE NAME\n");
+  len = pos;
+  pos = 0;
+  if (off < len && copied < n) {
+    start = off;
+    count = len - start;
+    if (count > n - copied)
+      count = n - copied;
+    if (either_copyout(user_dst, dst + copied, line + start, count) == -1)
+      return -1;
+    copied += count;
+  }
+  pos = len;
+
+  for (p = proc; p < &proc[NPROC] && copied < n; p++) {
+    acquire(&p->lock);
+    if (p->state != UNUSED) {
+      len = 0;
+      procfs_itoa(number, p->pid);
+      procfs_append(line, &len, sizeof(line), number);
+      procfs_append(line, &len, sizeof(line), " ");
+      procfs_append(line, &len, sizeof(line), procfs_state_name(p->state));
+      procfs_append(line, &len, sizeof(line), " ");
+      procfs_itoa64(number, p->sz);
+      procfs_append(line, &len, sizeof(line), number);
+      procfs_append(line, &len, sizeof(line), " ");
+      procfs_append(line, &len, sizeof(line), p->name);
+      procfs_append(line, &len, sizeof(line), "\n");
+      if (off < pos + len) {
+        start = off > pos ? off - pos : 0;
+        count = len - start;
+        if (count > n - copied)
+          count = n - copied;
+        if (either_copyout(user_dst, dst + copied, line + start, count) == -1) {
+          release(&p->lock);
+          return -1;
+        }
+        copied += count;
+      }
+      pos += len;
+    }
+    release(&p->lock);
+  }
+  return copied;
+}
+
 // 3. Hàm điều phối đọc chính của hệ thống tệp ảo ProcFS
 int
 procfs_read(struct inode *ip, int user_dst, uint64 dst, uint off, uint n)
@@ -159,6 +284,9 @@ procfs_read(struct inode *ip, int user_dst, uint64 dst, uint off, uint n)
   }
   if (ip == &proc_meminfo_inode || ip->inum == 9998) {
     return procfs_read_meminfo(user_dst, dst, off, n);
+  }
+  if (ip == &proc_processes_inode || ip->inum == 9997) {
+    return procfs_read_processes(user_dst, dst, off, n);
   }
   return -1;
 }

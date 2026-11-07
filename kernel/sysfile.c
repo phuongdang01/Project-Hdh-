@@ -338,6 +338,9 @@ sys_open(void)
   if ((n = argstr(0, path, MAXPATH)) < 0)
     return -1;
 
+  if ((omode & O_CREATE) && procfs_is_path(path))
+    return -1;
+
   begin_op();
 
   if (omode & O_CREATE) {
@@ -352,6 +355,11 @@ sys_open(void)
       return -1;
     }
     ilock(ip);
+    if (ip->type == T_PROC && omode != O_RDONLY) {
+      iunlockput(ip);
+      end_op();
+      return -1;
+    }
     if (ip->type == T_DIR && omode != O_RDONLY) {
       iunlockput(ip);
       end_op();
