@@ -60,12 +60,14 @@ void            ireclaim(int);
 //added
 int             procfs_read(struct inode*, int, uint64, uint, uint);
 struct inode*   procfs_lookup(char*);
+int             procfs_is_path(char*);
+int             procfs_read_processes(int, uint64, uint, uint);
 
 // kalloc.c
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
-
+uint64          freemem(void);
 // log.c
 void            initlog(int, struct superblock*);
 void            log_write(struct buf*);
