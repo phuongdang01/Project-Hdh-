@@ -80,6 +80,50 @@ test_processes(void)
 }
 
 void
+append_number(char *buf, int *len, int value)
+{
+  char digits[16];
+  int n = 0;
+
+  if (value == 0) {
+    buf[(*len)++] = '0';
+    return;
+  }
+  while (value > 0) {
+    digits[n++] = '0' + value % 10;
+    value /= 10;
+  }
+  while (n > 0)
+    buf[(*len)++] = digits[--n];
+}
+
+void
+test_status(void)
+{
+  char path[32];
+  char buf[256];
+  int fd, n, len = 6;
+
+  strcpy(path, "/proc/");
+  append_number(path, &len, getpid());
+  strcpy(path + len, "/status");
+  fd = open(path, O_RDONLY);
+  if (fd < 0) {
+    assert_test(0, "Doc /proc/<pid>/status");
+    return;
+  }
+  n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n > 0) {
+    buf[n] = '\0';
+    printf("%s", buf);
+    assert_test(1, "Doc /proc/<pid>/status");
+  } else {
+    assert_test(0, "Doc /proc/<pid>/status");
+  }
+}
+
+void
 test_open_modes(void)
 {
   int fd;
@@ -111,6 +155,7 @@ main(int argc, char *argv[])
   test_read_file("/proc/meminfo", "Doc file /proc/meminfo");
   test_small_buffer();
   test_processes();
+  test_status();
   test_open_modes();
 
   printf("=======================================\n");
