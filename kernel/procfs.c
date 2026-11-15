@@ -128,8 +128,7 @@ procfs_parse_status_path(char *path)
 int
 procfs_is_path(char *path)
 {
-  return procfs_streq(path, "/proc") == 0 ||
-         procfs_streq(path, "proc") == 0 ||
+  return procfs_streq(path, "/proc") == 0 || procfs_streq(path, "proc") == 0 ||
          (procfs_streq(path, "/proc/") == 0) ||
          (path[0] == '/' && path[1] == 'p' && path[2] == 'r' &&
           path[3] == 'o' && path[4] == 'c' && path[5] == '/') ||
