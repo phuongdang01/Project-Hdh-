@@ -85,12 +85,18 @@ static char *
 procfs_state_name(enum procstate state)
 {
   switch (state) {
-  case USED: return "USED";
-  case SLEEPING: return "SLEEP";
-  case RUNNABLE: return "RUNNABLE";
-  case RUNNING: return "RUNNING";
-  case ZOMBIE: return "ZOMBIE";
-  default: return "UNUSED";
+  case USED:
+    return "USED";
+  case SLEEPING:
+    return "SLEEP";
+  case RUNNABLE:
+    return "RUNNABLE";
+  case RUNNING:
+    return "RUNNING";
+  case ZOMBIE:
+    return "ZOMBIE";
+  default:
+    return "UNUSED";
   }
 }
 
@@ -108,8 +114,7 @@ procfs_parse_status_path(char *path)
   int pid = 0;
 
   if ((path[0] == '/' && path[1] != 'p') ||
-      (path[0] == '/' && path[2] != 'r') ||
-      (path[0] != '/' && path[0] != 'p'))
+      (path[0] == '/' && path[2] != 'r') || (path[0] != '/' && path[0] != 'p'))
     return -1;
   if (path[i] < '0' || path[i] > '9')
     return -1;
