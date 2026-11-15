@@ -5,10 +5,12 @@ struct file;
 struct inode;
 struct pipe;
 struct proc;
+struct procinfo;
 struct spinlock;
 struct sleeplock;
 struct stat;
 struct superblock;
+enum procstate;
 
 // bio.c
 void            binit(void);
@@ -55,12 +57,14 @@ void            stati(struct inode*, struct stat*);
 int             writei(struct inode*, int, uint64, uint, uint);
 void            itrunc(struct inode*);
 void            ireclaim(int);
-//added
+struct inode*   iget(uint, uint);
+char*           skipelem(char*, char*);
+// procfs.c
+int             is_procfs_path(const char*);
 int             procfs_read(struct inode*, int, uint64, uint, uint);
 struct inode*   procfs_lookup(char*);
 int             procfs_is_path(char*);
 int             procfs_read_processes(int, uint64, uint, uint);
-int             procfs_read_status(int, uint64, uint, uint, int);
 
 // kalloc.c
 void*           kalloc(void);
@@ -109,6 +113,10 @@ void            yield(void);
 int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
 int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
 void            procdump(void);
+int             procinfo_get(int, struct procinfo*);
+int             procinfo_pids(int*, int);
+const char*     procstate_name(enum procstate);
+int             proc_get_status_str(int, char*, int);
 
 // swtch.S
 void            swtch(struct context*, struct context*);
