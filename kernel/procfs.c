@@ -132,6 +132,12 @@ procfs_is_path(char *path)
           path[3] == 'c' && path[4] == '/');
 }
 
+int
+is_procfs_path(const char *path)
+{
+  return procfs_is_path((char *)path);
+}
+
 // 1. Hàm tra cứu và cấp phát Inode ảo cho ProcFS
 struct inode *
 procfs_lookup(char *path)
