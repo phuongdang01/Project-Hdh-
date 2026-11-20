@@ -63,6 +63,8 @@ char*           skipelem(char*, char*);
 int             is_procfs_path(const char*);
 int             procfs_read(struct inode*, int, uint64, uint, uint);
 struct inode*   procfs_lookup(char*);
+int             procfs_is_path(char*);
+int             procfs_read_processes(int, uint64, uint, uint);
 
 // kalloc.c
 void*           kalloc(void);

@@ -158,7 +158,9 @@ UPROGS=\
 	$U/_dorphan\
 	$U/_sync\
     $U/_procfs_test\
-	$U/_ps
+	$U/_procstress\
+	$U/_ps\
+	$U/_top
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)
 
