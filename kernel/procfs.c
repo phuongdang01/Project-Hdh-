@@ -17,6 +17,8 @@ extern struct spinlock tickslock;
 static struct inode proc_uptime_inode;
 static struct inode proc_meminfo_inode;
 static struct inode proc_processes_inode;
+static struct inode proc_root_inode;
+static struct inode proc_pid_inode[NPROC];
 static struct inode proc_status_inode[NPROC];
 static int proc_inited = 0;
 extern struct proc proc[NPROC];
@@ -142,12 +144,42 @@ is_procfs_path(const char *path)
   return procfs_is_path((char *)path);
 }
 
+static int
+procfs_parse_pid_path(char *path)
+{
+  int i = path[0] == '/' ? 6 : 5;
+  int pid = 0;
+
+  if (path[0] == '/' &&
+      (path[1] != 'p' || path[2] != 'r' || path[3] != 'o' ||
+       path[4] != 'c' || path[5] != '/'))
+    return -1;
+  if (path[0] != '/' &&
+      (path[0] != 'p' || path[1] != 'r' || path[2] != 'o' ||
+       path[3] != 'c' || path[4] != '/'))
+    return -1;
+  if (path[i] < '0' || path[i] > '9')
+    return -1;
+  while (path[i] >= '0' && path[i] <= '9')
+    pid = pid * 10 + path[i++] - '0';
+  if (path[i] != '\0')
+    return -1;
+  return pid > 0 ? pid : -1;
+}
+
 // 1. Hàm tra cứu và cấp phát Inode ảo cho ProcFS
 struct inode *
 procfs_lookup(char *path)
 {
   // Khởi tạo Inode ảo một lần duy nhất
   if (proc_inited == 0) {
+    initsleeplock(&proc_root_inode.lock, "proc_root");
+    proc_root_inode.dev = 0;
+    proc_root_inode.inum = 9000;
+    proc_root_inode.ref = 0;
+    proc_root_inode.type = T_PROC;
+    proc_root_inode.valid = 1;
+    proc_root_inode.nlink = 1;
     initsleeplock(&proc_uptime_inode.lock, "proc_uptime");
     proc_uptime_inode.dev = 0;
     proc_uptime_inode.inum = 9999; // Định danh inum ảo đặc biệt
@@ -170,6 +202,12 @@ procfs_lookup(char *path)
     proc_processes_inode.valid = 1;
     proc_processes_inode.nlink = 1;
     for (int i = 0; i < NPROC; i++) {
+      initsleeplock(&proc_pid_inode[i].lock, "proc_pid");
+      proc_pid_inode[i].dev = 0;
+      proc_pid_inode[i].inum = 9100 + i;
+      proc_pid_inode[i].type = T_PROC;
+      proc_pid_inode[i].valid = 1;
+      proc_pid_inode[i].nlink = 1;
       initsleeplock(&proc_status_inode[i].lock, "proc_status");
       proc_status_inode[i].dev = 0;
       proc_status_inode[i].inum = PROC_STATUS_INUM_BASE + i;
@@ -178,6 +216,14 @@ procfs_lookup(char *path)
       proc_status_inode[i].nlink = 1;
     }
     proc_inited = 1;
+  }
+
+  if (procfs_streq(path, "/proc") == 0 ||
+      procfs_streq(path, "proc") == 0 ||
+      procfs_streq(path, "/proc/") == 0 ||
+      procfs_streq(path, "proc/") == 0) {
+    proc_root_inode.ref++;
+    return &proc_root_inode;
   }
 
   // Khớp đường dẫn /proc/uptime hoặc proc/uptime
@@ -204,6 +250,16 @@ procfs_lookup(char *path)
       proc_status_inode[slot].ref++;
       proc_status_inode[slot].inum = PROC_STATUS_INUM_BASE + pid;
       return &proc_status_inode[slot];
+    }
+  }
+  pid = procfs_parse_pid_path(path);
+  if (pid > 0) {
+    struct procinfo info;
+    if (procinfo_get(pid, &info) == 0) {
+      int slot = pid % NPROC;
+      proc_pid_inode[slot].ref++;
+      proc_pid_inode[slot].inum = 9100 + pid;
+      return &proc_pid_inode[slot];
     }
   }
   return 0; // Trả về null nếu không tìm thấy tệp
@@ -342,10 +398,92 @@ procfs_read_status(int user_dst, uint64 dst, uint off, uint n, int pid)
   return m;
 }
 
+static int
+procfs_copy_dirents(int user_dst, uint64 dst, uint off, uint n,
+                    struct dirent *entries, int count)
+{
+  uint pos = 0;
+  int copied = 0;
+
+  for (int i = 0; i < count && copied < n; i++) {
+    uint len = sizeof(struct dirent);
+    if (off < pos + len) {
+      uint start = off > pos ? off - pos : 0;
+      uint m = len - start;
+      if (m > n - copied)
+        m = n - copied;
+      if (either_copyout(user_dst, dst + copied,
+                         (char *)&entries[i] + start, m) == -1)
+        return -1;
+      copied += m;
+    }
+    pos += len;
+  }
+  return copied;
+}
+
+static int
+procfs_readdir_root(int user_dst, uint64 dst, uint off, uint n)
+{
+  struct dirent entries[NPROC + 4];
+  int count = 0;
+
+  memset(entries, 0, sizeof(entries));
+  memmove(entries[count].name, ".", 2);
+  entries[count].inum = 9000;
+  count++;
+  memmove(entries[count].name, "..", 3);
+  entries[count].inum = 9000;
+  count++;
+  memmove(entries[count].name, "uptime", 7);
+  entries[count].inum = 9999;
+  count++;
+  memmove(entries[count].name, "meminfo", 8);
+  entries[count].inum = 9998;
+  count++;
+
+  for (struct proc *p = proc; p < &proc[NPROC] && count < NPROC + 4; p++) {
+    char number[16];
+    int len;
+
+    acquire(&p->lock);
+    if (p->state != UNUSED) {
+      len = procfs_itoa(number, p->pid);
+      memmove(entries[count].name, number, len);
+      entries[count].name[len] = '\0';
+      entries[count].inum = 9100 + p->pid;
+      count++;
+    }
+    release(&p->lock);
+  }
+  return procfs_copy_dirents(user_dst, dst, off, n, entries, count);
+}
+
+static int
+procfs_readdir_pid(int pid, int user_dst, uint64 dst, uint off, uint n)
+{
+  struct dirent entries[3];
+
+  memset(entries, 0, sizeof(entries));
+  memmove(entries[0].name, ".", 2);
+  entries[0].inum = 9100 + pid;
+  memmove(entries[1].name, "..", 3);
+  entries[1].inum = 9000;
+  memmove(entries[2].name, "status", 7);
+  entries[2].inum = 10000 + pid;
+  return procfs_copy_dirents(user_dst, dst, off, n, entries, 3);
+}
+
 // 3. Hàm điều phối đọc chính của hệ thống tệp ảo ProcFS
 int
 procfs_read(struct inode *ip, int user_dst, uint64 dst, uint off, uint n)
 {
+  if (ip == &proc_root_inode || ip->inum == 9000) {
+    return procfs_readdir_root(user_dst, dst, off, n);
+  }
+  if (ip->inum >= 9100 && ip->inum < 9100 + NPROC) {
+    return procfs_readdir_pid(ip->inum - 9100, user_dst, dst, off, n);
+  }
   if (ip == &proc_uptime_inode || ip->inum == 9999) {
     return procfs_read_uptime(user_dst, dst, off, n);
   }
