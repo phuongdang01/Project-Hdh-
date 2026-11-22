@@ -145,6 +145,7 @@ main(int argc, char *argv[])
   int refreshes = 0;
   int interval = 10;
   int round = 0;
+  int listener_pid = -1;
 
   if (argc > 1)
     refreshes = atoi(argv[1]);
@@ -156,7 +157,7 @@ main(int argc, char *argv[])
   printf("\033[?1049h\033[?25l");
   if (refreshes == 0) {
     int parent_pid = getpid();
-    int listener_pid = fork();
+    listener_pid = fork();
     if (listener_pid == 0)
       keyboard_listener(parent_pid);
   }
@@ -213,8 +214,13 @@ main(int argc, char *argv[])
     round++;
     if (refreshes > 0 && round >= refreshes)
       break;
-    if (pause(interval) < 0)
+    if (pause(interval) < 0) {
+      if (listener_pid > 0) {
+        kill(listener_pid);
+        wait(0);
+      }
       break;
+    }
   }
 
   printf("\033[0m\033[?25h\033[?1049l");
