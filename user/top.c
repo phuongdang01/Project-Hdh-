@@ -94,18 +94,6 @@ trim_line(char *text)
 }
 
 static void
-keyboard_listener(int parent_pid)
-{
-  char c;
-
-  while (read(0, &c, 1) == 1) {
-    if (c == 'q' || c == 'Q' || c == 3)
-      kill(parent_pid);
-  }
-  exit(0);
-}
-
-static void
 print_process(const char *pid)
 {
   char path[64];
@@ -145,7 +133,6 @@ main(int argc, char *argv[])
   int refreshes = 0;
   int interval = 10;
   int round = 0;
-  int listener_pid = -1;
 
   if (argc > 1)
     refreshes = atoi(argv[1]);
@@ -155,12 +142,6 @@ main(int argc, char *argv[])
     interval = 1;
 
   printf("\033[?1049h\033[?25l");
-  if (refreshes == 0) {
-    int parent_pid = getpid();
-    listener_pid = fork();
-    if (listener_pid == 0)
-      keyboard_listener(parent_pid);
-  }
 
   for (;;) {
     char uptime[128], meminfo[128];
@@ -210,17 +191,12 @@ main(int argc, char *argv[])
       close(fd);
     }
 
-    printf("\nPress q then Enter, or Ctrl-C then Enter\033[K");
+    printf("\nPress Ctrl-C to exit\033[K");
     round++;
     if (refreshes > 0 && round >= refreshes)
       break;
-    if (pause(interval) < 0) {
-      if (listener_pid > 0) {
-        kill(listener_pid);
-        wait(0);
-      }
+    if (pause(interval) < 0)
       break;
-    }
   }
 
   printf("\033[0m\033[?25h\033[?1049l");
