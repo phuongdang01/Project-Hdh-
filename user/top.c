@@ -164,6 +164,17 @@ main(int argc, char *argv[])
     if (read_text("/proc/meminfo", meminfo, sizeof(meminfo)) >= 0) {
       parse_field(meminfo, "MemFree:", memfree, sizeof(memfree));
       trim_line(memfree);
+      {
+        int i = strlen(memfree);
+        while (i > 0 && memfree[i - 1] == ' ')
+          i--;
+        if (i >= 2 && memfree[i - 1] == 'B') {
+          i--;
+          while (i > 0 && memfree[i - 1] == ' ')
+            i--;
+          memfree[i] = '\0';
+        }
+      }
       printf("MemFree: %s bytes\n", memfree);
     } else {
       printf("MemFree: unknown\n");

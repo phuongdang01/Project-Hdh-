@@ -487,10 +487,12 @@ sys_exec(void)
       break;
     }
     argv[i] = kalloc();
-    if (argv[i] == 0)
+    if (argv[i] == 0) {
       goto bad;
-    if (fetchstr(uarg, argv[i], PGSIZE) < 0)
+    }
+    if (fetchstr(uarg, argv[i], PGSIZE) < 0) {
       goto bad;
+    }
   }
 
   int ret = kexec(path, argv);

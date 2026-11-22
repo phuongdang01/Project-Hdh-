@@ -7,25 +7,42 @@
 #include "fs.h"
 #include "file.h"
 #include "stat.h"
+#include "memlayout.h"
 #include "proc.h"
 
-// Biến ticks và khóa đồng bộ thời gian từ kernel/trap.c
+// Quy ước virtual_inum trong ProcFS
+#define PROCFS_ROOT_INUM      9000
+#define PROCFS_UPTIME_INUM    9001
+#define PROCFS_MEMINFO_INUM   9002
+#define PROCFS_PROCESSES_INUM 9003
+#define PROCFS_PROC_DIR_BASE  9100
+#define PROCFS_STATUS_BASE    9200
+#define PROCFS_MAPS_BASE      9300
+
 extern uint ticks;
 extern struct spinlock tickslock;
-
-// Inode ảo tĩnh đại diện cho tệp /proc/uptime trong RAM
-static struct inode proc_uptime_inode;
-static struct inode proc_meminfo_inode;
-static struct inode proc_processes_inode;
-static struct inode proc_root_inode;
-static struct inode proc_pid_inode[NPROC];
-static struct inode proc_status_inode[NPROC];
-static int proc_inited = 0;
 extern struct proc proc[NPROC];
 
-#define PROC_STATUS_INUM_BASE 10000
+// Kiểm tra xem đường dẫn có thuộc hệ thống tệp ProcFS hay không
+int
+is_procfs_path(const char *path)
+{
+  if (path == 0)
+    return 0;
+  if (path[0] == '/') {
+    return (strncmp(path, "/proc", 5) == 0 &&
+            (path[5] == '\0' || path[5] == '/'));
+  }
+  return (strncmp(path, "proc", 4) == 0 && (path[4] == '\0' || path[4] == '/'));
+}
 
-// Hàm phụ trợ so sánh 2 chuỗi ký tự an toàn trong kernel
+int
+procfs_is_path(char *path)
+{
+  return is_procfs_path(path);
+}
+
+// So sánh 2 chuỗi ký tự
 static int
 procfs_streq(const char *s1, const char *s2)
 {
@@ -36,32 +53,9 @@ procfs_streq(const char *s1, const char *s2)
   return (uchar)*s1 - (uchar)*s2;
 }
 
-// Hàm phụ trợ chuyển đổi số nguyên dương sang chuỗi ASCII
+// Chuyển đổi số nguyên không âm (64-bit) sang chuỗi ASCII
 static int
-procfs_itoa(char *buf, uint n)
-{
-  char tmp[16];
-  int i = 0, j = 0;
-
-  if (n == 0) {
-    buf[j++] = '0';
-    buf[j] = '\0';
-    return j;
-  }
-
-  while (n > 0) {
-    tmp[i++] = (n % 10) + '0';
-    n /= 10;
-  }
-
-  while (i > 0)
-    buf[j++] = tmp[--i];
-  buf[j] = '\0';
-  return j;
-}
-
-static int
-procfs_itoa64(char *buf, uint64 n)
+procfs_itoa(char *buf, uint64 n)
 {
   char tmp[24];
   int i = 0, j = 0;
@@ -77,16 +71,49 @@ procfs_itoa64(char *buf, uint64 n)
     n /= 10;
   }
 
-  while (i > 0)
+  while (i > 0) {
     buf[j++] = tmp[--i];
+  }
   buf[j] = '\0';
   return j;
+}
+
+static int
+procfs_itoa64(char *buf, uint64 n)
+{
+  return procfs_itoa(buf, n);
+}
+
+static int
+is_all_digits(const char *s)
+{
+  if (*s == 0)
+    return 0;
+  while (*s) {
+    if (*s < '0' || *s > '9')
+      return 0;
+    s++;
+  }
+  return 1;
+}
+
+static int
+proc_atoi(const char *s)
+{
+  int n = 0;
+  while (*s >= '0' && *s <= '9') {
+    n = n * 10 + (*s - '0');
+    s++;
+  }
+  return n;
 }
 
 static char *
 procfs_state_name(enum procstate state)
 {
   switch (state) {
+  case UNUSED:
+    return "UNUSED";
   case USED:
     return "USED";
   case SLEEPING:
@@ -98,7 +125,7 @@ procfs_state_name(enum procstate state)
   case ZOMBIE:
     return "ZOMBIE";
   default:
-    return "UNUSED";
+    return "UNKNOWN";
   }
 }
 
@@ -109,207 +136,340 @@ procfs_append(char *buf, int *len, int max, char *text)
     buf[(*len)++] = *text++;
 }
 
+// Tìm vị trí process trong mảng proc[] theo pid. Trả về idx hoặc -1 nếu không tồn tại.
 static int
-procfs_parse_status_path(char *path)
+proc_find_idx_by_pid(int pid)
 {
-  int i = path[0] == '/' ? 6 : 5;
-  int pid = 0;
-
-  if ((path[0] == '/' && path[1] != 'p') ||
-      (path[0] == '/' && path[2] != 'r') || (path[0] != '/' && path[0] != 'p'))
+  if (pid <= 0)
     return -1;
-  if (path[i] < '0' || path[i] > '9')
-    return -1;
-  while (path[i] >= '0' && path[i] <= '9')
-    pid = pid * 10 + path[i++] - '0';
-  if (procfs_streq(path + i, "/status") != 0)
-    return -1;
-  return pid > 0 ? pid : -1;
+  for (int i = 0; i < NPROC; i++) {
+    acquire(&proc[i].lock);
+    if (proc[i].state != UNUSED && proc[i].pid == pid) {
+      release(&proc[i].lock);
+      return i;
+    }
+    release(&proc[i].lock);
+  }
+  return -1;
 }
 
-int
-procfs_is_path(char *path)
+// Cấp phát & Khởi tạo Inode ảo trên RAM qua iget(ROOTDEV, virtual_inum)
+static struct inode *
+procfs_get_inode(uint inum)
 {
-  return procfs_streq(path, "/proc") == 0 || procfs_streq(path, "proc") == 0 ||
-         (procfs_streq(path, "/proc/") == 0) ||
-         (path[0] == '/' && path[1] == 'p' && path[2] == 'r' &&
-          path[3] == 'o' && path[4] == 'c' && path[5] == '/') ||
-         (path[0] == 'p' && path[1] == 'r' && path[2] == 'o' &&
-          path[3] == 'c' && path[4] == '/');
+  struct inode *ip = iget(ROOTDEV, inum);
+  if (ip == 0)
+    return 0;
+  ip->type = T_PROC;
+  ip->valid = 1;
+  ip->nlink = 1;
+  ip->size = 0;
+  return ip;
 }
 
-int
-is_procfs_path(const char *path)
-{
-  return procfs_is_path((char *)path);
-}
-
-static int
-procfs_parse_pid_path(char *path)
-{
-  int i = path[0] == '/' ? 6 : 5;
-  int pid = 0;
-
-  if (path[0] == '/' &&
-      (path[1] != 'p' || path[2] != 'r' || path[3] != 'o' ||
-       path[4] != 'c' || path[5] != '/'))
-    return -1;
-  if (path[0] != '/' &&
-      (path[0] != 'p' || path[1] != 'r' || path[2] != 'o' ||
-       path[3] != 'c' || path[4] != '/'))
-    return -1;
-  if (path[i] < '0' || path[i] > '9')
-    return -1;
-  while (path[i] >= '0' && path[i] <= '9')
-    pid = pid * 10 + path[i++] - '0';
-  if (path[i] != '\0')
-    return -1;
-  return pid > 0 ? pid : -1;
-}
-
-// 1. Hàm tra cứu và cấp phát Inode ảo cho ProcFS
+// Phân giải chính xác cây thư mục ảo 2 cấp
 struct inode *
 procfs_lookup(char *path)
 {
-  // Khởi tạo Inode ảo một lần duy nhất
-  if (proc_inited == 0) {
-    initsleeplock(&proc_root_inode.lock, "proc_root");
-    proc_root_inode.dev = 0;
-    proc_root_inode.inum = 9000;
-    proc_root_inode.ref = 0;
-    proc_root_inode.type = T_PROC;
-    proc_root_inode.valid = 1;
-    proc_root_inode.nlink = 1;
-    initsleeplock(&proc_uptime_inode.lock, "proc_uptime");
-    proc_uptime_inode.dev = 0;
-    proc_uptime_inode.inum = 9999; // Định danh inum ảo đặc biệt
-    proc_uptime_inode.ref = 0;
-    proc_uptime_inode.type = T_PROC;
-    proc_uptime_inode.valid = 1; // valid = 1 để ilock() không đọc block từ đĩa
-    proc_uptime_inode.nlink = 1;
-    initsleeplock(&proc_meminfo_inode.lock, "proc_meminfo");
-    proc_meminfo_inode.dev = 0;
-    proc_meminfo_inode.inum = 9998;
-    proc_meminfo_inode.ref = 0;
-    proc_meminfo_inode.type = T_PROC;
-    proc_meminfo_inode.valid = 1;
-    proc_meminfo_inode.nlink = 1;
-    initsleeplock(&proc_processes_inode.lock, "proc_processes");
-    proc_processes_inode.dev = 0;
-    proc_processes_inode.inum = 9997;
-    proc_processes_inode.ref = 0;
-    proc_processes_inode.type = T_PROC;
-    proc_processes_inode.valid = 1;
-    proc_processes_inode.nlink = 1;
-    for (int i = 0; i < NPROC; i++) {
-      initsleeplock(&proc_pid_inode[i].lock, "proc_pid");
-      proc_pid_inode[i].dev = 0;
-      proc_pid_inode[i].inum = 9100 + i;
-      proc_pid_inode[i].type = T_PROC;
-      proc_pid_inode[i].valid = 1;
-      proc_pid_inode[i].nlink = 1;
-      initsleeplock(&proc_status_inode[i].lock, "proc_status");
-      proc_status_inode[i].dev = 0;
-      proc_status_inode[i].inum = PROC_STATUS_INUM_BASE + i;
-      proc_status_inode[i].type = T_PROC;
-      proc_status_inode[i].valid = 1;
-      proc_status_inode[i].nlink = 1;
-    }
-    proc_inited = 1;
+  char name1[DIRSIZ];
+  char name2[DIRSIZ];
+  char *p = path;
+
+  // Bước 1: Lấy thành phần đầu tiên, bắt buộc phải là "proc"
+  p = skipelem(p, name1);
+  if (p == 0 || procfs_streq(name1, "proc") != 0)
+    return 0;
+
+  // Nếu đường dẫn dừng sau "proc" (e.g. "/proc", "proc", "/proc/")
+  if (*p == '\0') {
+    return procfs_get_inode(PROCFS_ROOT_INUM);
   }
 
-  if (procfs_streq(path, "/proc") == 0 ||
-      procfs_streq(path, "proc") == 0 ||
-      procfs_streq(path, "/proc/") == 0 ||
-      procfs_streq(path, "proc/") == 0) {
-    proc_root_inode.ref++;
-    return &proc_root_inode;
+  // Bước 2: Lấy thành phần thứ 2 (cấp 1)
+  p = skipelem(p, name1);
+  if (p == 0)
+    return procfs_get_inode(PROCFS_ROOT_INUM);
+
+  // Nếu kết thúc sau thành phần thứ 2 (e.g. "/proc/uptime", "/proc/1", "/proc/.")
+  if (*p == '\0') {
+    if (procfs_streq(name1, ".") == 0)
+      return procfs_get_inode(PROCFS_ROOT_INUM);
+    if (procfs_streq(name1, "..") == 0)
+      return iget(ROOTDEV, ROOTINO);
+    if (procfs_streq(name1, "uptime") == 0)
+      return procfs_get_inode(PROCFS_UPTIME_INUM);
+    if (procfs_streq(name1, "meminfo") == 0)
+      return procfs_get_inode(PROCFS_MEMINFO_INUM);
+    if (procfs_streq(name1, "processes") == 0)
+      return procfs_get_inode(PROCFS_PROCESSES_INUM);
+    if (is_all_digits(name1)) {
+      int pid = proc_atoi(name1);
+      int idx = proc_find_idx_by_pid(pid);
+      if (idx >= 0)
+        return procfs_get_inode(PROCFS_PROC_DIR_BASE + idx);
+    }
+    return 0;
   }
 
-  // Khớp đường dẫn /proc/uptime hoặc proc/uptime
-  if (procfs_streq(path, "/proc/uptime") == 0 ||
-      procfs_streq(path, "proc/uptime") == 0) {
-    proc_uptime_inode.ref++;
-    return &proc_uptime_inode;
-  }
-  if (procfs_streq(path, "/proc/meminfo") == 0 ||
-      procfs_streq(path, "proc/meminfo") == 0) {
-    proc_meminfo_inode.ref++;
-    return &proc_meminfo_inode;
-  }
-  if (procfs_streq(path, "/proc/processes") == 0 ||
-      procfs_streq(path, "proc/processes") == 0) {
-    proc_processes_inode.ref++;
-    return &proc_processes_inode;
-  }
-  int pid = procfs_parse_status_path(path);
-  if (pid > 0) {
-    struct procinfo info;
-    if (procinfo_get(pid, &info) == 0) {
-      int slot = pid % NPROC;
-      proc_status_inode[slot].ref++;
-      proc_status_inode[slot].inum = PROC_STATUS_INUM_BASE + pid;
-      return &proc_status_inode[slot];
+  // Bước 3: Lấy thành phần thứ 3 (cấp 2)
+  p = skipelem(p, name2);
+  if (p == 0)
+    return 0;
+
+  // Nếu vẫn còn thành phần tiếp theo (vượt quá độ sâu 2 cấp của ProcFS)
+  if (*p != '\0')
+    return 0;
+
+  // Nhánh A: Thành phần cấp 1 là PID
+  if (is_all_digits(name1)) {
+    int pid = proc_atoi(name1);
+    int idx = proc_find_idx_by_pid(pid);
+    if (idx < 0)
+      return 0;
+
+    if (procfs_streq(name2, ".") == 0)
+      return procfs_get_inode(PROCFS_PROC_DIR_BASE + idx);
+    if (procfs_streq(name2, "..") == 0)
+      return procfs_get_inode(PROCFS_ROOT_INUM);
+    if (procfs_streq(name2, "status") == 0)
+      return procfs_get_inode(PROCFS_STATUS_BASE + idx);
+    if (procfs_streq(name2, "maps") == 0) {
+      acquire(&proc[idx].lock);
+      if (proc[idx].state == UNUSED || proc[idx].state == ZOMBIE ||
+          proc[idx].pid != pid) {
+        release(&proc[idx].lock);
+        return 0;
+      }
+      release(&proc[idx].lock);
+      return procfs_get_inode(PROCFS_MAPS_BASE + idx);
     }
+    return 0;
   }
-  pid = procfs_parse_pid_path(path);
-  if (pid > 0) {
-    struct procinfo info;
-    if (procinfo_get(pid, &info) == 0) {
-      int slot = pid % NPROC;
-      proc_pid_inode[slot].ref++;
-      proc_pid_inode[slot].inum = 9100 + pid;
-      return &proc_pid_inode[slot];
+
+  // Nhánh B: Thành phần cấp 1 là "." (e.g. /proc/./uptime)
+  if (procfs_streq(name1, ".") == 0) {
+    if (procfs_streq(name2, ".") == 0)
+      return procfs_get_inode(PROCFS_ROOT_INUM);
+    if (procfs_streq(name2, "..") == 0)
+      return iget(ROOTDEV, ROOTINO);
+    if (procfs_streq(name2, "uptime") == 0)
+      return procfs_get_inode(PROCFS_UPTIME_INUM);
+    if (procfs_streq(name2, "meminfo") == 0)
+      return procfs_get_inode(PROCFS_MEMINFO_INUM);
+    if (procfs_streq(name2, "processes") == 0)
+      return procfs_get_inode(PROCFS_PROCESSES_INUM);
+    if (is_all_digits(name2)) {
+      int pid = proc_atoi(name2);
+      int idx = proc_find_idx_by_pid(pid);
+      if (idx >= 0)
+        return procfs_get_inode(PROCFS_PROC_DIR_BASE + idx);
     }
+    return 0;
   }
-  return 0; // Trả về null nếu không tìm thấy tệp
+
+  return 0;
 }
 
-// 2. Logic sinh dữ liệu on-demand cho /proc/uptime
-int
+// Sinh từng dirent cho thư mục gốc /proc
+static int
+procfs_get_dirent_root(int idx, struct dirent *de)
+{
+  if (idx < 0)
+    return 0;
+
+  memset(de, 0, sizeof(*de));
+  if (idx == 0) {
+    de->inum = PROCFS_ROOT_INUM;
+    safestrcpy(de->name, ".", sizeof(de->name));
+    return 1;
+  }
+  if (idx == 1) {
+    de->inum = ROOTINO;
+    safestrcpy(de->name, "..", sizeof(de->name));
+    return 1;
+  }
+  if (idx == 2) {
+    de->inum = PROCFS_UPTIME_INUM;
+    safestrcpy(de->name, "uptime", sizeof(de->name));
+    return 1;
+  }
+  if (idx == 3) {
+    de->inum = PROCFS_MEMINFO_INUM;
+    safestrcpy(de->name, "meminfo", sizeof(de->name));
+    return 1;
+  }
+  if (idx == 4) {
+    de->inum = PROCFS_PROCESSES_INUM;
+    safestrcpy(de->name, "processes", sizeof(de->name));
+    return 1;
+  }
+
+  // Quét mảng proc[] sinh các thư mục số mang tên PID đang hoạt động
+  int target = idx - 5;
+  int current = 0;
+  for (int i = 0; i < NPROC; i++) {
+    acquire(&proc[i].lock);
+    if (proc[i].state != UNUSED) {
+      if (current == target) {
+        de->inum = PROCFS_PROC_DIR_BASE + i;
+        procfs_itoa(de->name, proc[i].pid);
+        release(&proc[i].lock);
+        return 1;
+      }
+      current++;
+    }
+    release(&proc[i].lock);
+  }
+  return 0;
+}
+
+// Duyệt thư mục ảo /proc
+static int
+procfs_readdir_root(int user_dst, uint64 dst, uint off, uint n)
+{
+  struct dirent de;
+  uint total = 0;
+
+  while (n > 0) {
+    int entry_idx = (off + total) / sizeof(struct dirent);
+    int de_off = (off + total) % sizeof(struct dirent);
+
+    if (!procfs_get_dirent_root(entry_idx, &de))
+      break;
+
+    uint avail = sizeof(struct dirent) - de_off;
+    uint m = (n < avail) ? n : avail;
+
+    if (either_copyout(user_dst, dst + total, (char *)&de + de_off, m) == -1)
+      return -1;
+
+    total += m;
+    n -= m;
+  }
+
+  return total;
+}
+
+// Sinh từng dirent cho thư mục tiến trình /proc/<pid>
+static int
+procfs_get_dirent_pid(int proc_idx, int idx, struct dirent *de)
+{
+  if (idx < 0)
+    return 0;
+
+  memset(de, 0, sizeof(*de));
+  if (idx == 0) {
+    de->inum = PROCFS_PROC_DIR_BASE + proc_idx;
+    safestrcpy(de->name, ".", sizeof(de->name));
+    return 1;
+  }
+  if (idx == 1) {
+    de->inum = PROCFS_ROOT_INUM;
+    safestrcpy(de->name, "..", sizeof(de->name));
+    return 1;
+  }
+  if (idx == 2) {
+    de->inum = PROCFS_STATUS_BASE + proc_idx;
+    safestrcpy(de->name, "status", sizeof(de->name));
+    return 1;
+  }
+  if (idx == 3) {
+    de->inum = PROCFS_MAPS_BASE + proc_idx;
+    safestrcpy(de->name, "maps", sizeof(de->name));
+    return 1;
+  }
+  return 0;
+}
+
+// Duyệt thư mục ảo /proc/<pid>
+static int
+procfs_readdir_pid(int proc_idx, int user_dst, uint64 dst, uint off, uint n)
+{
+  if (proc_idx < 0 || proc_idx >= NPROC)
+    return -1;
+
+  acquire(&proc[proc_idx].lock);
+  if (proc[proc_idx].state == UNUSED) {
+    release(&proc[proc_idx].lock);
+    return 0;
+  }
+  release(&proc[proc_idx].lock);
+
+  struct dirent de;
+  uint total = 0;
+
+  while (n > 0) {
+    int entry_idx = (off + total) / sizeof(struct dirent);
+    int de_off = (off + total) % sizeof(struct dirent);
+
+    if (!procfs_get_dirent_pid(proc_idx, entry_idx, &de))
+      break;
+
+    uint avail = sizeof(struct dirent) - de_off;
+    uint m = (n < avail) ? n : avail;
+
+    if (either_copyout(user_dst, dst + total, (char *)&de + de_off, m) == -1)
+      return -1;
+
+    total += m;
+    n -= m;
+  }
+
+  return total;
+}
+
+// Đọc /proc/uptime
+static int
 procfs_read_uptime(int user_dst, uint64 dst, uint off, uint n)
 {
   char buf[32];
 
-  // Chiếm khóa tickslock an toàn trước khi đọc ticks
   acquire(&tickslock);
   uint cur_ticks = ticks;
   release(&tickslock);
 
-  // Định dạng chuỗi: "<ticks>\n"
   int len = procfs_itoa(buf, cur_ticks);
   buf[len++] = '\n';
   buf[len] = '\0';
 
-  // Nếu vị trí đọc (offset) vượt quá độ dài dữ liệu hiện có -> trả về 0 (EOF)
   if (off >= len)
     return 0;
 
-  // Tính số lượng byte thực tế cần chép
   uint m = len - off;
   if (m > n)
     m = n;
 
-  // Sao chép an toàn từ buffer kernel sang buffer của user process
   if (either_copyout(user_dst, dst, buf + off, m) == -1)
     return -1;
 
   return m;
 }
 
-int
+// Đọc /proc/meminfo
+static int
 procfs_read_meminfo(int user_dst, uint64 dst, uint off, uint n)
 {
-  char buf[64];
+  char buf[128];
+  uint64 total_b = PHYSTOP - KERNBASE;
   uint64 free_b = freemem();
   int len = 0;
 
-  char *prefix = "MemFree: ";
-  while (*prefix) {
-    buf[len++] = *prefix++;
-  }
+  // Ghi MemTotal
+  char *str1 = "MemTotal: ";
+  while (*str1)
+    buf[len++] = *str1++;
+  len += procfs_itoa(buf + len, total_b);
+  buf[len++] = ' ';
+  buf[len++] = 'B';
+  buf[len++] = '\n';
 
+  // Ghi MemFree
+  char *str2 = "MemFree: ";
+  while (*str2)
+    buf[len++] = *str2++;
   len += procfs_itoa(buf + len, free_b);
+  buf[len++] = ' ';
+  buf[len++] = 'B';
   buf[len++] = '\n';
   buf[len] = '\0';
 
@@ -326,6 +486,7 @@ procfs_read_meminfo(int user_dst, uint64 dst, uint off, uint n)
   return m;
 }
 
+// Đọc /proc/processes (cho công cụ top / monitoring)
 int
 procfs_read_processes(int user_dst, uint64 dst, uint off, uint n)
 {
@@ -381,121 +542,113 @@ procfs_read_processes(int user_dst, uint64 dst, uint off, uint n)
   return copied;
 }
 
+// Đọc /proc/<pid>/status
 static int
-procfs_read_status(int user_dst, uint64 dst, uint off, uint n, int pid)
+procfs_read_status(int idx, int user_dst, uint64 dst, uint off, uint n)
 {
+  if (idx < 0 || idx >= NPROC)
+    return -1;
+
+  acquire(&proc[idx].lock);
+  if (proc[idx].state == UNUSED) {
+    release(&proc[idx].lock);
+    return 0;
+  }
+  int pid = proc[idx].pid;
+  release(&proc[idx].lock);
+
   char buf[256];
   int len = proc_get_status_str(pid, buf, sizeof(buf));
-  uint m;
+  if (len < 0)
+    return 0;
 
-  if (len < 0 || off >= len)
-    return len < 0 ? -1 : 0;
-  m = len - off;
+  if (off >= len)
+    return 0;
+
+  uint m = len - off;
   if (m > n)
     m = n;
+
   if (either_copyout(user_dst, dst, buf + off, m) == -1)
     return -1;
+
+  return m;
+}
+
+// Đọc /proc/<pid>/maps
+static int
+procfs_read_pid_maps(int idx, int user_dst, uint64 dst, uint off, uint n)
+{
+  if (idx < 0 || idx >= NPROC)
+    return -1;
+
+  char *buf = kalloc();
+  if (buf == 0)
+    return -1;
+
+  acquire(&proc[idx].lock);
+  if (proc[idx].state == UNUSED || proc[idx].state == ZOMBIE ||
+      proc[idx].pagetable == 0) {
+    release(&proc[idx].lock);
+    kfree(buf);
+    return 0;
+  }
+
+  int len = vm_proc_maps_snapshot(proc[idx].pagetable, buf, PGSIZE);
+  release(&proc[idx].lock);
+
+  if (off >= len) {
+    kfree(buf);
+    return 0;
+  }
+
+  uint m = len - off;
+  if (m > n)
+    m = n;
+
+  if (either_copyout(user_dst, dst, buf + off, m) == -1) {
+    kfree(buf);
+    return -1;
+  }
+
+  kfree(buf);
   return m;
 }
 
 static int
-procfs_copy_dirents(int user_dst, uint64 dst, uint off, uint n,
-                    struct dirent *entries, int count)
+procfs_read_maps(int idx, int user_dst, uint64 dst, uint off, uint n)
 {
-  uint pos = 0;
-  int copied = 0;
-
-  for (int i = 0; i < count && copied < n; i++) {
-    uint len = sizeof(struct dirent);
-    if (off < pos + len) {
-      uint start = off > pos ? off - pos : 0;
-      uint m = len - start;
-      if (m > n - copied)
-        m = n - copied;
-      if (either_copyout(user_dst, dst + copied,
-                         (char *)&entries[i] + start, m) == -1)
-        return -1;
-      copied += m;
-    }
-    pos += len;
-  }
-  return copied;
+  return procfs_read_pid_maps(idx, user_dst, dst, off, n);
 }
 
-static int
-procfs_readdir_root(int user_dst, uint64 dst, uint off, uint n)
-{
-  struct dirent entries[NPROC + 4];
-  int count = 0;
-
-  memset(entries, 0, sizeof(entries));
-  memmove(entries[count].name, ".", 2);
-  entries[count].inum = 9000;
-  count++;
-  memmove(entries[count].name, "..", 3);
-  entries[count].inum = 9000;
-  count++;
-  memmove(entries[count].name, "uptime", 7);
-  entries[count].inum = 9999;
-  count++;
-  memmove(entries[count].name, "meminfo", 8);
-  entries[count].inum = 9998;
-  count++;
-
-  for (struct proc *p = proc; p < &proc[NPROC] && count < NPROC + 4; p++) {
-    char number[16];
-    int len;
-
-    acquire(&p->lock);
-    if (p->state != UNUSED) {
-      len = procfs_itoa(number, p->pid);
-      memmove(entries[count].name, number, len);
-      entries[count].name[len] = '\0';
-      entries[count].inum = 9100 + p->pid;
-      count++;
-    }
-    release(&p->lock);
-  }
-  return procfs_copy_dirents(user_dst, dst, off, n, entries, count);
-}
-
-static int
-procfs_readdir_pid(int pid, int user_dst, uint64 dst, uint off, uint n)
-{
-  struct dirent entries[3];
-
-  memset(entries, 0, sizeof(entries));
-  memmove(entries[0].name, ".", 2);
-  entries[0].inum = 9100 + pid;
-  memmove(entries[1].name, "..", 3);
-  entries[1].inum = 9000;
-  memmove(entries[2].name, "status", 7);
-  entries[2].inum = 10000 + pid;
-  return procfs_copy_dirents(user_dst, dst, off, n, entries, 3);
-}
-
-// 3. Hàm điều phối đọc chính của hệ thống tệp ảo ProcFS
+// Hàm điều phối đọc chính của hệ thống tệp ảo ProcFS
 int
 procfs_read(struct inode *ip, int user_dst, uint64 dst, uint off, uint n)
 {
-  if (ip == &proc_root_inode || ip->inum == 9000) {
+  if (ip->inum == PROCFS_ROOT_INUM) {
     return procfs_readdir_root(user_dst, dst, off, n);
   }
-  if (ip->inum >= 9100 && ip->inum < 9100 + NPROC) {
-    return procfs_readdir_pid(ip->inum - 9100, user_dst, dst, off, n);
-  }
-  if (ip == &proc_uptime_inode || ip->inum == 9999) {
+  if (ip->inum == PROCFS_UPTIME_INUM) {
     return procfs_read_uptime(user_dst, dst, off, n);
   }
-  if (ip == &proc_meminfo_inode || ip->inum == 9998) {
+  if (ip->inum == PROCFS_MEMINFO_INUM) {
     return procfs_read_meminfo(user_dst, dst, off, n);
   }
-  if (ip == &proc_processes_inode || ip->inum == 9997) {
+  if (ip->inum == PROCFS_PROCESSES_INUM) {
     return procfs_read_processes(user_dst, dst, off, n);
   }
-  if (ip->inum >= PROC_STATUS_INUM_BASE) {
-    return procfs_read_status(user_dst, dst, off, n,
-                              ip->inum - PROC_STATUS_INUM_BASE);
+  if (ip->inum >= PROCFS_PROC_DIR_BASE &&
+      ip->inum < PROCFS_PROC_DIR_BASE + NPROC) {
+    int idx = ip->inum - PROCFS_PROC_DIR_BASE;
+    return procfs_readdir_pid(idx, user_dst, dst, off, n);
+  }
+  if (ip->inum >= PROCFS_STATUS_BASE && ip->inum < PROCFS_STATUS_BASE + NPROC) {
+    int idx = ip->inum - PROCFS_STATUS_BASE;
+    return procfs_read_status(idx, user_dst, dst, off, n);
+  }
+  if (ip->inum >= PROCFS_MAPS_BASE && ip->inum < PROCFS_MAPS_BASE + NPROC) {
+    int idx = ip->inum - PROCFS_MAPS_BASE;
+    return procfs_read_maps(idx, user_dst, dst, off, n);
   }
   return -1;
 }
