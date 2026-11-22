@@ -7,7 +7,7 @@
 static void
 clear_screen(void)
 {
-  printf("\033[2J\033[H");
+  printf("\033[H\033[2J\033[3J");
 }
 
 static int
@@ -141,6 +141,8 @@ main(int argc, char *argv[])
   if (interval < 1)
     interval = 1;
 
+  printf("\033[?1049h\033[?25l");
+
   for (;;) {
     char uptime[128], meminfo[128];
     char memfree[32];
@@ -189,7 +191,7 @@ main(int argc, char *argv[])
       close(fd);
     }
 
-    printf("\nPress Ctrl-C to exit");
+    printf("\nPress Ctrl-C to exit\033[K");
     round++;
     if (refreshes > 0 && round >= refreshes)
       break;
@@ -197,6 +199,6 @@ main(int argc, char *argv[])
       break;
   }
 
-  printf("\033[?25h\033[0m\n");
+  printf("\033[0m\033[?25h\033[?1049l");
   exit(0);
 }
