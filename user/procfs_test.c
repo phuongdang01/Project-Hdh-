@@ -287,16 +287,17 @@ test_read_only_protection(void)
   assert_test(lnk < 0, "Chan thao tac link /proc");
 }
 
-// Kiểm thử rò rỉ Inode cache (NINODE = 50, lặp 150 lần mở và đóng)
+// Kiểm thử rò rỉ Inode cache (NINODE = 50, lặp 1.000 lần mở và đóng)
 void
 test_inode_cache_leak(void)
 {
   int ok = 1;
-  for (int i = 0; i < 150; i++) {
+  for (int i = 0; i < 1000; i++) {
     int fd1 = open("/proc/uptime", O_RDONLY);
     int fd2 = open("/proc/meminfo", O_RDONLY);
     int fd3 = open("/proc/1/status", O_RDONLY);
-    if (fd1 < 0 || fd2 < 0 || fd3 < 0) {
+    int fd4 = open("/proc/1/maps", O_RDONLY);
+    if (fd1 < 0 || fd2 < 0 || fd3 < 0 || fd4 < 0) {
       ok = 0;
       if (fd1 >= 0)
         close(fd1);
@@ -304,13 +305,16 @@ test_inode_cache_leak(void)
         close(fd2);
       if (fd3 >= 0)
         close(fd3);
+      if (fd4 >= 0)
+        close(fd4);
       break;
     }
     close(fd1);
     close(fd2);
     close(fd3);
+    close(fd4);
   }
-  assert_test(ok, "Khong ro ri Inode cache (lap 150 lan mo/dong file)");
+  assert_test(ok, "Khong ro ri Inode cache (lap 1000 lan mo/dong file)");
 }
 
 // Kiểm thử tính năng sinh danh sách thư mục động theo p->state != UNUSED

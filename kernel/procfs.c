@@ -233,8 +233,16 @@ procfs_lookup(char *path)
       return procfs_get_inode(PROCFS_ROOT_INUM);
     if (procfs_streq(name2, "status") == 0)
       return procfs_get_inode(PROCFS_STATUS_BASE + idx);
-    if (procfs_streq(name2, "maps") == 0)
+    if (procfs_streq(name2, "maps") == 0) {
+      acquire(&proc[idx].lock);
+      if (proc[idx].state == UNUSED || proc[idx].state == ZOMBIE ||
+          proc[idx].pid != pid) {
+        release(&proc[idx].lock);
+        return 0;
+      }
+      release(&proc[idx].lock);
       return procfs_get_inode(PROCFS_MAPS_BASE + idx);
+    }
     return 0;
   }
 
@@ -579,7 +587,8 @@ procfs_read_pid_maps(int idx, int user_dst, uint64 dst, uint off, uint n)
     return -1;
 
   acquire(&proc[idx].lock);
-  if (proc[idx].state == UNUSED || proc[idx].pagetable == 0) {
+  if (proc[idx].state == UNUSED || proc[idx].state == ZOMBIE ||
+      proc[idx].pagetable == 0) {
     release(&proc[idx].lock);
     kfree(buf);
     return 0;
